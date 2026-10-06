@@ -1,0 +1,1631 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>SysLang Lander</title>
+<style>
+  :root{ --bg:#0b1220; --card:#1e293b; --acc:#38bdf8; --acc2:#60a5fa;
+         --fg:#f8fafc; --mut:#94a3b8; --bd:#334155; }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font:14px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace}
+  header{display:flex;gap:10px;align-items:center;padding:10px 14px;
+         border-bottom:1px solid var(--bd);flex-wrap:wrap}
+  h1{font-size:16px;margin:0;color:var(--acc)}
+  #stateChip{margin-left:auto;padding:4px 10px;border:1px solid var(--bd);
+             border-radius:999px;color:var(--mut);font-size:12px}
+  main{display:grid;grid-template-columns:1.1fr .9fr;gap:12px;padding:12px}
+  .card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:10px}
+  textarea,input,select{background:#0b1220;color:var(--fg);border:1px solid var(--bd);
+        border-radius:8px;padding:8px;font:inherit;width:100%}
+  #editor{height:220px;resize:vertical}
+  button{min-height:44px;min-width:44px;padding:0 14px;border-radius:8px;border:1px solid var(--bd);
+         background:var(--acc2);color:#0b1220;font-weight:700;cursor:pointer}
+  button:active{transform:translateY(1px)}
+  .row{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0}
+  #output{background:#0b1220;border:1px solid var(--bd);border-radius:8px;padding:8px;
+          min-height:70px;max-height:160px;overflow:auto;color:var(--mut);white-space:pre-wrap}
+  .grid{display:grid;grid-template-columns:repeat(32,1fr);gap:1px;background:var(--bd);
+        padding:2px;border-radius:6px;max-height:180px;overflow:auto}
+  .cell{aspect-ratio:1;background:#0b1220}
+  .cell[data-on="1"]{background:var(--acc)}
+  #screenCanvas{width:100%;max-width:360px;aspect-ratio:1;background:#0b1220;
+        border:1px solid var(--bd);border-radius:8px;image-rendering:pixelated}
+  #lineHighlight{border:1px dashed var(--bd);border-radius:6px;padding:4px 8px;
+        color:var(--mut);font-size:12px}
+  .lbl{color:var(--mut);font-size:12px;margin:6px 0 2px}
+  @media(max-width:820px){ main{grid-template-columns:1fr} }
+</style>
+</head>
+<body>
+<header>
+  <h1>SysLang</h1>
+  <span id="stateChip">IDLE</span>
+  <button id="saveBtn">Save</button>
+  <button id="loadBtn">Load</button>
+  <input id="programName" placeholder="program name" style="width:160px">
+</header>
+<main>
+  <section class="card">
+    <select id="examples" aria-label="Examples"><option>Select an example…</option></select>
+    <div class="row">
+      <button id="runBtn">Run</button>
+      <button id="stepBtn">Step</button>
+      <button id="resetBtn">Reset</button>
+      <button id="stopBtn">Stop</button>
+    </div>
+    <textarea id="editor" spellcheck="false" placeholder="# SysLang source"></textarea>
+    <div id="lineHighlight" data-line="0">line: —</div>
+    <div class="lbl">Output</div>
+    <div id="output"></div>
+  </section>
+  <section class="card">
+    <div class="lbl">Screen (16×16)</div>
+    <canvas id="screenCanvas" width="360" height="360"></canvas>
+    <div class="lbl">Memory inspector address (0..1023)</div>
+    <input id="addrInput" type="number" min="0" max="1023" value="0">
+    <div class="lbl">RAM</div>
+    <div id="ramGrid" class="grid"></div>
+    <div class="lbl">STORAGE</div>
+    <div id="storageGrid" class="grid"></div>
+  </section>
+</main>
+<script>
+/* ==== INLINE: syslang_screen.js ==== */
+/* =====================================================================
+ * SysLang Screen Renderer  —  v1.0
+ * 16x16 LED matrix renderer into #screenCanvas using Canvas 2D.
+ * Plain ES5 browser JS. Exposes window.ScreenRenderer.
+ *
+ * Governed by syslang_contract.md (SCREEN = 256 bits, index = y*16+x).
+ * The renderer NEVER mutates engine arrays directly except through the
+ * documented setPixel() path, which writes into SysLang._engine.screen
+ * (the live array) — the only sanctioned mutation channel for the editor.
+ *
+ * Performance rules honoured here:
+ *   - Canvas is sized to devicePixelRatio ONLY on init and window resize.
+ *     NEVER inside the render loop.
+ *   - devicePixelRatio is capped at 1.5 on screens < 820px.
+ *   - LITE mode (no glow, no shadows) when innerWidth < 820 or
+ *     navigator.hardwareConcurrency <= 4.
+ *   - Grid + coordinate labels are drawn as cheap text/1px strokes.
+ * ===================================================================== */
+(function (global) {
+  "use strict";
+
+  /* ------------------------------ Constants ------------------------- */
+  var N = 16;                   // grid dimension (16x16)
+  var COUNT = N * N;            // 256 LEDs
+  var ACCENT = "#38bdf8";       // on-LED colour
+  var SLATE = "#1e293b";        // off-LED colour
+  var GRID = "#334155";         // grid stroke
+  var LABEL = "#64748b";        // axis label colour
+  var BG = "#0b1220";           // canvas backdrop
+  var GLOW = "rgba(56,189,248,0.55)"; // accent glow
+
+  /* --------------------------- Environment -------------------------- */
+  var LITE = (typeof navigator !== "undefined" &&
+              typeof navigator.hardwareConcurrency === "number" &&
+              navigator.hardwareConcurrency <= 4) ||
+             (typeof innerWidth !== "undefined" && innerWidth < 820);
+
+  var HIGH_SPEC = !LITE;        // "device is high-spec" => glow allowed
+  var CANVAS = null;
+  var CTX = null;
+
+  /* Cached geometry (recomputed only on resize) */
+  var CSS_W = 0, CSS_H = 0;      // logical CSS size of the LED area
+  var PAD = 0;                   // space reserved for axis labels
+  var CELL = 0;                  // LED cell pitch (px, CSS units)
+  var LED = 0;                   // rounded-square side length
+  var RAD = 0;                   // corner radius
+  var DPR = 1;                   // capped device pixel ratio
+  var ORIGIN_X = 0, ORIGIN_Y = 0;
+
+  /* Last rendered state (for hit-testing / redraws) */
+  var LAST = null;
+
+  /* --------------------------- Utilities --------------------------- */
+  function roundRect(c, x, y, w, h, r) {
+    if (r <= 0.01) { c.rect(x, y, w, h); return; }
+    c.moveTo(x + r, y);
+    c.lineTo(x + w - r, y);
+    c.arcTo(x + w, y, x + w, y + r, r);
+    c.lineTo(x + w, y + h - r);
+    c.arcTo(x + w, y + h, x + w - r, y + h, r);
+    c.lineTo(x + r, y + h);
+    c.arcTo(x, y + h, x, y + h - r, r);
+    c.lineTo(x, y + r);
+    c.arcTo(x, y, x + r, y, r);
+    if (c.closePath) c.closePath();
+  }
+
+  /* --------------- Engine write channel (sanctioned) --------------- */
+  /* setPixel writes into the LIVE engine screen array via SysLang._engine.
+   * This is intentional: clicking an LED must update engine state so the
+   * machine's `plot` reads observe it. getState() snapshots are read-only. */
+  function engineScreen() {
+    var S = global.SysLang;
+    if (S && S._engine && S._engine.screen && S._engine.screen.length === COUNT) {
+      return S._engine.screen;
+    }
+    return null;
+  }
+
+  /* ------------------------- Public API ---------------------------- */
+  var ScreenRenderer = {
+
+    /* init(canvas, opts): wire up canvas + listeners. Idempotent. */
+    init: function (canvas, opts) {
+      opts = opts || {};
+      CANVAS = canvas || (typeof document !== "undefined" && document.getElementById("screenCanvas"));
+      if (!CANVAS) return false;
+      CTX = CANVAS.getContext("2d");
+      if (!CTX) return false;
+
+      /* Environment overrides from opts (allow UI team to force LITE). */
+      if (typeof opts.lite === "boolean") { LITE = opts.lite; HIGH_SPEC = !opts.lite; }
+      else if (opts.forceHighSpec === true) { HIGH_SPEC = true; LITE = false; }
+      PAD = PAD || 0;
+
+      ScreenRenderer.resize();            // size canvas (initial)
+      ScreenRenderer._bindPointer(CANVAS);
+
+      if (typeof addEventListener === "function") {
+        addEventListener("resize", ScreenRenderer.resize, { passive: true });
+      }
+      if (!LAST) ScreenRenderer.draw(global.SysLang ? global.SysLang.getState() : null);
+      return true;
+    },
+
+    /* resize(): resize the backing store to the canvas CSS box * capped DPR.
+     * Called ONLY on init and window resize — never in the render loop. */
+    resize: function () {
+      if (!CANVAS || !CTX) return;
+      var rect = CANVAS.getBoundingClientRect();
+      // Fallback to attribute/offset if layout not yet available.
+      CSS_W = Math.max(1, Math.round(rect.width || CANVAS.clientWidth || CANVAS.width || 320));
+      CSS_H = Math.max(1, Math.round(rect.height || CANVAS.clientHeight || CANVAS.height || 320));
+      // Square LED area = the smaller dimension; reserve room for labels.
+      PAD = Math.round(Math.min(CSS_W, CSS_H) * 0.07);
+      if (PAD < 10) PAD = 10;
+      if (PAD > 22) PAD = 22;
+
+      /* DPR cap: 1.5 on screens < 820px, else device's DPR clamped to 3. */
+      var rawDpr = (typeof devicePixelRatio === "number") ? devicePixelRatio : 1;
+      var wide = (typeof innerWidth === "number") ? innerWidth : CSS_W;
+      DPR = wide < 820 ? Math.min(rawDpr, 1.5) : Math.min(rawDpr, 3);
+      if (!isFinite(DPR) || DPR <= 0) DPR = 1;
+
+      var bw = Math.round(CSS_W * DPR);
+      var bh = Math.round(CSS_H * DPR);
+      if (CANVAS.width !== bw) CANVAS.width = bw;   // assigning clears canvas
+      if (CANVAS.height !== bh) CANVAS.height = bh;
+
+      /* Layout geometry, in CSS units; CTX is scaled by DPR below. */
+      var side = Math.min(CSS_W, CSS_H) - PAD * 2;
+      if (side < 1) side = 1;
+      CELL = side / N;
+      LED = CELL * 0.78;
+      RAD = Math.max(1, LED * 0.22);
+      ORIGIN_X = (CSS_W - side) / 2;
+      ORIGIN_Y = (CSS_H - side) / 2;
+
+      CTX.setTransform(DPR, 0, 0, DPR, 0, 0);   // work in CSS units thereafter
+      if (LAST) ScreenRenderer.draw(LAST);        // repaint with new geometry
+    },
+
+    /* draw(state): render 256 LEDs from state.screen (Array of 256). */
+    draw: function (state) {
+      if (!CTX) return;
+      var screen = (state && state.screen && state.screen.length) ? state.screen : null;
+      LAST = state;
+
+      /* Backdrop (fill in CSS units; transform already applied). */
+      CTX.setTransform(DPR, 0, 0, DPR, 0, 0);
+      CTX.fillStyle = BG;
+      CTX.fillRect(0, 0, CSS_W, CSS_H);
+
+      var x, y, i, cx, cy, px, py;
+
+      /* --- Grid lines (cheap: 17 strokes total) --- */
+      CTX.lineWidth = 1;
+      CTX.strokeStyle = GRID;
+      CTX.beginPath();
+      for (i = 0; i <= N; i++) {
+        var gx = ORIGIN_X + i * CELL;
+        var gy = ORIGIN_Y + i * CELL;
+        CTX.moveTo(Math.round(gx) + 0.5, ORIGIN_Y);
+        CTX.lineTo(Math.round(gx) + 0.5, ORIGIN_Y + N * CELL);
+        CTX.moveTo(ORIGIN_X, Math.round(gy) + 0.5);
+        CTX.lineTo(ORIGIN_X + N * CELL, Math.round(gy) + 0.5);
+      }
+      CTX.stroke();
+
+      /* --- Coordinate labels (0-15 on both edges) --- */
+      if (CELL >= 9) {
+        CTX.fillStyle = LABEL;
+        CTX.font = Math.max(8, Math.round(PAD * 0.62)) + "px system-ui, sans-serif";
+        CTX.textAlign = "center";
+        CTX.textBaseline = "middle";
+        for (i = 0; i < N; i++) {
+          var lx = ORIGIN_X + i * CELL + CELL / 2;
+          var ly = ORIGIN_Y + i * CELL + CELL / 2;
+          CTX.fillText(String(i), lx, ORIGIN_Y - PAD * 0.5);        // top
+          CTX.fillText(String(i), ORIGIN_X - PAD * 0.55, ly);       // left
+        }
+      }
+
+      /* --- LEDs --- */
+      var useGlow = HIGH_SPEC && !LITE;   // subtle glow only on high-spec
+      for (y = 0; y < N; y++) {
+        for (x = 0; x < N; x++) {
+          i = y * N + x;
+          var on = screen ? (screen[i] & 1) : 0;
+
+          cx = ORIGIN_X + x * CELL + (CELL - LED) / 2;
+          cy = ORIGIN_Y + y * CELL + (CELL - LED) / 2;
+
+          if (on) {
+            if (useGlow) {
+              CTX.shadowColor = GLOW;
+              CTX.shadowBlur = LED * 0.9;
+            } else {
+              CTX.shadowBlur = 0;
+              CTX.shadowColor = "transparent";
+            }
+            CTX.fillStyle = ACCENT;
+          } else {
+            if (useGlow) { CTX.shadowBlur = 0; CTX.shadowColor = "transparent"; }
+            CTX.fillStyle = SLATE;
+          }
+
+          CTX.beginPath();
+          roundRect(CTX, cx, cy, LED, LED, RAD);
+          CTX.fill();
+        }
+      }
+      /* Reset shadow so subsequent draws are clean. */
+      CTX.shadowBlur = 0;
+      CTX.shadowColor = "transparent";
+      if (state && state.pc !== undefined) LAST = state;
+    },
+
+    /* getPixel(x,y) -> 0/1  (reads engine state via SysLang.getState). */
+    getPixel: function (x, y) {
+      x = Math.trunc(Number(x)); y = Math.trunc(Number(y));
+      if (isNaN(x) || isNaN(y) || x < 0 || x >= N || y < 0 || y >= N) return 0;
+      var S = global.SysLang;
+      if (!S || typeof S.getState !== "function") return 0;
+      var st = S.getState();
+      return (st && st.screen) ? (st.screen[y * N + x] & 1) : 0;
+    },
+
+    /* setPixel(x,y,v): write a bit into engine screen state; repaint. */
+    setPixel: function (x, y, v) {
+      x = Math.trunc(Number(x)); y = Math.trunc(Number(y));
+      if (isNaN(x) || isNaN(y) || x < 0 || x >= N || y < 0 || y >= N) return false;
+      var bit = (v | 0) & 1;
+      var live = engineScreen();
+      if (live) live[y * N + x] = bit;
+      /* Repaint from a fresh snapshot so both paths agree. */
+      var S = global.SysLang;
+      ScreenRenderer.draw(S && typeof S.getState === "function" ? S.getState() : null);
+      return true;
+    },
+
+    /* toggle(x,y): flip an LED; returns the new value (0/1). */
+    toggle: function (x, y) {
+      x = Math.trunc(Number(x)); y = Math.trunc(Number(y));
+      if (isNaN(x) || isNaN(y) || x < 0 || x >= N || y < 0 || y >= N) return 0;
+      var live = engineScreen();
+      var cur;
+      if (live) {
+        cur = live[y * N + x] & 1;
+        live[y * N + x] = cur ? 0 : 1;
+        cur = cur ? 0 : 1;
+      } else {
+        cur = ScreenRenderer.getPixel(x, y) ? 0 : 1;
+      }
+      var S = global.SysLang;
+      ScreenRenderer.draw(S && typeof S.getState === "function" ? S.getState() : null);
+      return cur;
+    },
+
+    /* clear(): blank the whole screen and repaint. */
+    clear: function () {
+      var live = engineScreen();
+      var i;
+      if (live) { for (i = 0; i < COUNT; i++) live[i] = 0; }
+      var S = global.SysLang;
+      ScreenRenderer.draw(S && typeof S.getState === "function" ? S.getState() : null);
+      return true;
+    },
+
+    /* ---- Diagnostics / composition helpers used by the UI ---- */
+    isLite: function () { return LITE || !HIGH_SPEC; },
+    getDpr: function () { return DPR; },
+    getGeometry: function () {
+      return { width: CSS_W, height: CSS_H, cell: CELL, led: LED,
+               pad: PAD, originX: ORIGIN_X, originY: ORIGIN_Y, dpr: DPR, lite: LITE };
+    },
+
+    /* ---------------- Pointer interaction (mouse + touch) -------------- */
+    _bindPointer: function (canvas) {
+      if (!canvas || !canvas.addEventListener) return;
+
+      function coordsFromEvent(ev) {
+        var rect = canvas.getBoundingClientRect();
+        var px = (ev.clientX !== undefined ? ev.clientX : (ev.touches && ev.touches[0] ? ev.touches[0].clientX : 0));
+        var py = (ev.clientY !== undefined ? ev.clientY : (ev.touches && ev.touches[0] ? ev.touches[0].clientY : 0));
+        var lx = px - rect.left;
+        var ly = py - rect.top;
+        /* CSS box may differ from measured CSS_W/H; normalise. */
+        var sx = rect.width ? (CSS_W / rect.width) : 1;
+        var sy = rect.height ? (CSS_H / rect.height) : 1;
+        lx *= sx; ly *= sy;
+        var gx = Math.floor((lx - ORIGIN_X) / CELL);
+        var gy = Math.floor((ly - ORIGIN_Y) / CELL);
+        return { x: gx, y: gy };
+      }
+
+      function handle(ev) {
+        var c = coordsFromEvent(ev);
+        if (c.x < 0 || c.x >= N || c.y < 0 || c.y >= N) return;
+        if (ev.preventDefault) ev.preventDefault();
+        ScreenRenderer.toggle(c.x, c.y);
+      }
+
+      canvas.addEventListener("click", handle);
+      canvas.addEventListener("touchend", handle, { passive: false });
+      canvas.addEventListener("touchstart", function (ev) {
+        if (ev.cancelable && ev.preventDefault) ev.preventDefault();
+      }, { passive: false });
+
+      /* Hover cursor feedback (cheap, non-blocking). */
+      canvas.addEventListener("mousemove", function (ev) {
+        var c = coordsFromEvent(ev);
+        var inside = (c.x >= 0 && c.x < N && c.y >= 0 && c.y < N);
+        var want = inside ? "pointer" : "default";
+        if (canvas.style && canvas.style.cursor !== want) canvas.style.cursor = want;
+      });
+    }
+  };
+
+  global.ScreenRenderer = ScreenRenderer;
+
+})(typeof window !== "undefined" ? window : this);
+
+</script>
+<script>
+
+/* =====================================================================
+ * SysLang Core Interpreter  —  v1.0
+ * Node-based bit-machine language.  Plain ES5 browser JS.
+ * Exposes window.SysLang per syslang_contract.md
+ *
+ * Architecture: tokenizer -> recursive-descent parser -> AST ->
+ *   flattened instruction tape (linear VM) -> step-oriented evaluator.
+ *   step() executes exactly ONE tape instruction; run() loops step().
+ * ===================================================================== */
+(function (global) {
+  "use strict";
+
+  /* ------------------------- Machine limits ------------------------ */
+  var RAM_SIZE = 1024, STORAGE_SIZE = 1024, SCREEN_SIZE = 256;
+  var SCREEN_W = 16, SCREEN_H = 16;
+  var MAX_WHILE_ITERS = 10000, MAX_LOOP_ITERS = 10000, MAX_CALL_DEPTH = 200;
+
+  /* ============================ ERRORS ============================= */
+  function LangError(line, msg) { this.name = "LangError"; this.line = line; this.message = msg; }
+  LangError.prototype.toString = function () { return "line " + this.line + ": " + this.message; };
+  function fail(line, msg) { throw new LangError(line, msg); }
+  function errString(e) {
+    if (e && e.name === "LangError") return "line " + e.line + ": " + e.message;
+    return "runtime error: " + (e && e.message ? e.message : String(e));
+  }
+
+  /* ========================== TOKENIZER =========================== */
+  var KEYWORDS = {
+    let:1, get:1, set:1, save:1, load:1, plot:1, led:1, group:1, groupcopy:1,
+    g:1, if:1, else:1, loop:1, while:1, func:1, return:1, and:1, or:1, not:1,
+    xor:1, band:1, bor:1, bxor:1, bnot:1
+  };
+
+  function tokenize(src) {
+    var toks = [], i = 0, n = src.length, line = 1;
+    function isDigit(c){ return c >= "0" && c <= "9"; }
+    function isAlpha(c){ return (c>="a"&&c<="z")||(c>="A"&&c<="Z")||c==="_"; }
+    function isAlnum(c){ return isAlpha(c) || isDigit(c); }
+    while (i < n) {
+      var c = src[i];
+      if (c === "\n") { line++; i++; continue; }
+      if (c === " " || c === "\t" || c === "\r") { i++; continue; }
+      if (c === "#") { while (i < n && src[i] !== "\n") i++; continue; }
+      if (c === ";" ) { toks.push({t:"sep", v:";", line:line}); i++; continue; }
+      if (isDigit(c)) {
+        var s = "";
+        while (i < n && isDigit(src[i])) { s += src[i]; i++; }
+        toks.push({t:"num", v:parseInt(s,10), line:line}); continue;
+      }
+      if (isAlpha(c)) {
+        var id = "";
+        while (i < n && isAlnum(src[i])) { id += src[i]; i++; }
+        toks.push({t: KEYWORDS[id] ? "kw" : "id", v:id, line:line}); continue;
+      }
+      // two-char operators
+      var two = src.substr(i,2);
+      if (two === "==" || two === "!=" || two === "<=" || two === ">=" || two === "..") {
+        toks.push({t:"op", v:two, line:line}); i += 2; continue;
+      }
+      if (c==="+"||c==="-"||c==="*"||c==="/"||c==="%"||c==="<"||c===">"||
+          c==="("||c===")"||c==="{"||c==="}"||c==="["||c==="]"||c===","||c==="=") {
+        toks.push({t:"op", v:c, line:line}); i++; continue;
+      }
+      fail(line, "unexpected character '" + c + "'");
+    }
+    toks.push({t:"eof", v:"<eof>", line:line});
+    return toks;
+  }
+
+  /* ============================ PARSER ============================ */
+  /* AST node kinds:
+     Program {body:[]}
+     Let {name, expr}
+     Assign {name, expr}
+     GAssign {group, index, expr}
+     Set {addr, val}   Save{addr} Load{addr} Led{x,y,val}
+     GroupDef {name, addrs:[]}   GroupCopy {dst, src}
+     If {cond, then:[], else:[]|null}
+     Loop {var, from, to, body:[]}
+     While {cond, body:[]}
+     FuncDef {name, params:[], body:[]}
+     Return {expr|null}
+     ExprStmt {expr}
+     --- expressions ---
+     Num {value}  Var {name}  Unary {op, expr}  Binary {op, l, r}
+     Get {addr}  Plot {x,y}  GRead {group, index}
+     Call {name, args:[]}
+  */
+  function Parser(toks) { this.toks = toks; this.pos = 0; }
+  Parser.prototype.peek = function(){ return this.toks[this.pos]; };
+  Parser.prototype.next = function(){ return this.toks[this.pos++]; };
+  Parser.prototype.at = function(t, v){
+    var tk = this.peek();
+    return tk.t === t && (v===undefined || tk.v === v);
+  };
+  Parser.prototype.atKw = function(v){ return this.at("kw", v); };
+  Parser.prototype.expect = function(t, v){
+    if (!this.at(t,v)) {
+      var tk = this.peek();
+      fail(tk.line, "unexpected token '" + tk.v + "' (expected " + (v||t) + ")");
+    }
+    return this.next();
+  };
+  Parser.prototype.skipSeps = function(){ while (this.at("sep")) this.next(); };
+
+  Parser.prototype.parseProgram = function(){
+    var body = this.parseBlockStatements(true);
+    if (!this.at("eof")) { var tk=this.peek(); fail(tk.line, "unexpected token '"+tk.v+"'"); }
+    return {kind:"Program", body:body};
+  };
+
+  // stop is a function(tok)->bool; if not provided, parse until EOF
+  Parser.prototype.parseBlockStatements = function(untilEof, closing){
+    var stmts = [];
+    while (true) {
+      this.skipSeps();
+      if (untilEof) { if (this.at("eof")) break; }
+      else if (closing && this.at("op", closing)) break;
+      else if (this.at("eof")) break;
+      var s = this.parseStatement();
+      if (s) stmts.push(s);
+    }
+    return stmts;
+  };
+
+  Parser.prototype.parseBlock = function(){
+    this.expect("op","{");
+    var body = this.parseBlockStatements(false, "}");
+    this.expect("op","}");
+    return body;
+  };
+
+  Parser.prototype.parseStatement = function(){
+    var tk = this.peek();
+    if (tk.t === "kw") {
+      switch (tk.v) {
+        case "let": {
+          this.next();
+          var name = this.expect("id").v;
+          this.expect("op","=");
+          var e = this.parseExpr();
+          return {kind:"Let", name:name, expr:e, line:tk.line};
+        }
+        case "set": {
+          this.next();
+          var a = this.parseExpr();
+          this.expect("op",",");
+          var v = this.parseExpr();
+          return {kind:"Set", addr:a, val:v, line:tk.line};
+        }
+        case "save": { this.next(); return {kind:"Save", addr:this.parseExpr(), line:tk.line}; }
+        case "load": { this.next(); return {kind:"Load", addr:this.parseExpr(), line:tk.line}; }
+        case "led": {
+          this.next();
+          var x = this.parseExpr(); this.expect("op",",");
+          var y = this.parseExpr(); this.expect("op",",");
+          var lv = this.parseExpr();
+          return {kind:"Led", x:x, y:y, val:lv, line:tk.line};
+        }
+        case "group": {
+          this.next();
+          var gname = this.expect("id").v;
+          var addrs = [];
+          while (this.at("num")) { addrs.push(this.next().v); }
+          if (addrs.length === 0) fail(tk.line, "group '" + gname + "' needs at least one address");
+          return {kind:"GroupDef", name:gname, addrs:addrs, line:tk.line};
+        }
+        case "groupcopy": {
+          this.next();
+          var dst = this.expect("id").v;
+          var src = this.expect("id").v;
+          return {kind:"GroupCopy", dst:dst, src:src, line:tk.line};
+        }
+        case "g": {
+          this.next();
+          var grp = this.expect("id").v;
+          this.expect("op","[");
+          var idx = this.parseExpr();
+          this.expect("op","]");
+          this.expect("op","=");
+          var val = this.parseExpr();
+          return {kind:"GAssign", group:grp, index:idx, expr:val, line:tk.line};
+        }
+        case "if": {
+          this.next();
+          var cond = this.parseExpr();
+          var thenB = this.parseBlock();
+          var elseB = null;
+          this.skipSepsInline();
+          if (this.atKw("else")) {
+            this.next();
+            this.skipSepsInline();
+            if (this.atKw("if")) {
+              // else-if -> wrap as else { if ... }
+              elseB = [ this.parseStatement() ];
+            } else {
+              elseB = this.parseBlock();
+            }
+          }
+          return {kind:"If", cond:cond, then:thenB, else:elseB, line:tk.line};
+        }
+        case "loop": {
+          this.next();
+          var lv2 = this.expect("id").v;
+          this.expect("op","=");
+          var from = this.parseExpr();
+          this.expect("op","..");
+          var to = this.parseExpr();
+          var body = this.parseBlock();
+          return {kind:"Loop", var:lv2, from:from, to:to, body:body, line:tk.line};
+        }
+        case "while": {
+          this.next();
+          var wc = this.parseExpr();
+          var wb = this.parseBlock();
+          return {kind:"While", cond:wc, body:wb, line:tk.line};
+        }
+        case "func": {
+          this.next();
+          var fname = this.expect("id").v;
+          this.expect("op","(");
+          var params = [];
+          if (!this.at("op",")")) {
+            params.push(this.expect("id").v);
+            while (this.at("op",",")) { this.next(); params.push(this.expect("id").v); }
+          }
+          this.expect("op",")");
+          var fbody = this.parseBlock();
+          return {kind:"FuncDef", name:fname, params:params, body:fbody, line:tk.line};
+        }
+        case "return": {
+          this.next();
+          var re = null;
+          if (!this.at("op","}") && !this.at("sep") && !this.at("eof")) re = this.parseExpr();
+          return {kind:"Return", expr:re, line:tk.line};
+        }
+      }
+      // keyword used as expression start? fall through to expr-stmt
+    }
+    // assignment to bare id : name = expr
+    if (tk.t === "id") {
+      var nxt = this.toks[this.pos+1];
+      if (nxt && nxt.t === "op" && nxt.v === "=") {
+        this.next(); this.next();
+        var ae = this.parseExpr();
+        return {kind:"Assign", name:tk.v, expr:ae, line:tk.line};
+      }
+    }
+    // otherwise expression statement
+    var expr = this.parseExpr();
+    return {kind:"ExprStmt", expr:expr, line:tk.line};
+  };
+
+  Parser.prototype.skipSepsInline = function(){ while (this.at("sep")) this.next(); };
+
+  /* ---- expression parsing with precedence ---- */
+  Parser.prototype.parseExpr = function(){ return this.parseOr(); };
+  Parser.prototype.parseOr = function(){
+    var l = this.parseXor();
+    while (this.atKw("or")) { var op=this.next().v; var r=this.parseXor(); l={kind:"Binary",op:op,l:l,r:r}; }
+    return l;
+  };
+  Parser.prototype.parseXor = function(){
+    var l = this.parseAnd();
+    while (this.atKw("xor")) { var op=this.next().v; var r=this.parseAnd(); l={kind:"Binary",op:op,l:l,r:r}; }
+    return l;
+  };
+  Parser.prototype.parseAnd = function(){
+    var l = this.parseEquality();
+    while (this.atKw("and") || this.atKw("band")) {
+      var op=this.next().v; var r=this.parseEquality(); l={kind:"Binary",op:op,l:l,r:r};
+    }
+    return l;
+  };
+  Parser.prototype.parseEquality = function(){
+    var l = this.parseRelational();
+    while (this.at("op","==") || this.at("op","!=") || this.atKw("bor") || this.atKw("bxor")) {
+      var op=this.next().v; var r=this.parseRelational(); l={kind:"Binary",op:op,l:l,r:r};
+    }
+    return l;
+  };
+  Parser.prototype.parseRelational = function(){
+    var l = this.parseAdditive();
+    while (this.at("op","<")||this.at("op",">")||this.at("op","<=")||this.at("op",">=")) {
+      var op=this.next().v; var r=this.parseAdditive(); l={kind:"Binary",op:op,l:l,r:r};
+    }
+    return l;
+  };
+  Parser.prototype.parseAdditive = function(){
+    var l = this.parseMultiplicative();
+    while (this.at("op","+")||this.at("op","-")) {
+      var op=this.next().v; var r=this.parseMultiplicative(); l={kind:"Binary",op:op,l:l,r:r};
+    }
+    return l;
+  };
+  Parser.prototype.parseMultiplicative = function(){
+    var l = this.parseUnary();
+    while (this.at("op","*")||this.at("op","/")||this.at("op","%")) {
+      var op=this.next().v; var r=this.parseUnary(); l={kind:"Binary",op:op,l:l,r:r};
+    }
+    return l;
+  };
+  Parser.prototype.parseUnary = function(){
+    if (this.at("op","-")||this.atKw("not")||this.atKw("bnot")) {
+      var op=this.next().v; var e=this.parseUnary(); return {kind:"Unary",op:op,expr:e};
+    }
+    return this.parsePrimary();
+  };
+  Parser.prototype.parsePrimary = function(){
+    var tk = this.peek();
+    if (tk.t === "num") { this.next(); return {kind:"Num", value:tk.v}; }
+    if (tk.t === "op" && tk.v === "(") {
+      this.next(); var e=this.parseExpr(); this.expect("op",")"); return e;
+    }
+    if (tk.t === "kw") {
+      if (tk.v === "get") { this.next(); return {kind:"Get", addr:this.parseExpr()}; }
+      if (tk.v === "plot") {
+        this.next();
+        var x=this.parseExpr(); this.expect("op",","); var y=this.parseExpr();
+        return {kind:"Plot", x:x, y:y};
+      }
+      if (tk.v === "g") {
+        this.next();
+        var grp=this.expect("id").v; this.expect("op","[");
+        var idx=this.parseExpr(); this.expect("op","]");
+        return {kind:"GRead", group:grp, index:idx};
+      }
+    }
+    if (tk.t === "id") {
+      this.next();
+      if (this.at("op","(")) {
+        this.next();
+        var args=[];
+        if (!this.at("op",")")) {
+          args.push(this.parseExpr());
+          while (this.at("op",",")) { this.next(); args.push(this.parseExpr()); }
+        }
+        this.expect("op",")");
+        return {kind:"Call", name:tk.v, args:args};
+      }
+      return {kind:"Var", name:tk.v};
+    }
+    fail(tk.line, "unexpected token '" + tk.v + "' (expected expression)");
+  };
+
+  /* ==================== FLATTEN AST -> TAPE ====================== */
+  /* Tape instruction: {op, line, args...}
+     Ops: PUSH, POP, GETVAR, LET, ASSIGN, GET, SET, SAVE, LOAD, PLOT, LED,
+          GREAD, GWRITE, GROUPDEF, GROUPCOPY, JMP, JZ, CALL, RET, FUNC,
+          LOOPINIT, LOOPCHECK, LOOPNEXT, WHILECHECK, WHILEINC, NOP
+  */
+  function Compiler() { this.code = []; this.funcs = {}; }
+  Compiler.prototype.emit = function(instr){ this.code.push(instr); return this.code.length - 1; };
+  Compiler.prototype.here = function(){ return this.code.length; };
+
+  Compiler.prototype.compileProgram = function(ast){
+    var mainStart = this.here();
+    this.compileStatements(ast.body);
+    this.emit({op:"HALT"});
+    var mainEnd = this.here();
+    return {code:this.code, funcs:this.funcs, entry:mainStart, end:mainEnd};
+  };
+
+  Compiler.prototype.compileStatements = function(list){
+    for (var i=0;i<list.length;i++) this.compileStatement(list[i]);
+  };
+
+  Compiler.prototype.compileStatement = function(s){
+    switch (s.kind) {
+      case "Let":
+        this.compileExpr(s.expr);
+        this.emit({op:"LET", name:s.name, line:s.line});
+        break;
+      case "Assign":
+        this.compileExpr(s.expr);
+        this.emit({op:"ASSIGN", name:s.name, line:s.line});
+        break;
+      case "GAssign":
+        this.compileExpr(s.index);
+        this.compileExpr(s.expr);
+        this.emit({op:"GWRITE", group:s.group, line:s.line});
+        break;
+      case "Set":
+        this.compileExpr(s.addr);
+        this.compileExpr(s.val);
+        this.emit({op:"SET", line:s.line});
+        break;
+      case "Save":
+        this.compileExpr(s.addr);
+        this.emit({op:"SAVE", line:s.line});
+        break;
+      case "Load":
+        this.compileExpr(s.addr);
+        this.emit({op:"LOAD", line:s.line});
+        break;
+      case "Led":
+        this.compileExpr(s.x);
+        this.compileExpr(s.y);
+        this.compileExpr(s.val);
+        this.emit({op:"LED", line:s.line});
+        break;
+      case "GroupDef":
+        this.emit({op:"GROUPDEF", name:s.name, addrs:s.addrs.slice(), line:s.line});
+        break;
+      case "GroupCopy":
+        this.emit({op:"GROUPCOPY", dst:s.dst, src:s.src, line:s.line});
+        break;
+      case "If": {
+        this.compileExpr(s.cond);
+        var jz = this.emit({op:"JZ", line:s.line, target:-1});
+        this.compileStatements(s.then);
+        if (s.else) {
+          var jmp = this.emit({op:"JMP", line:s.line, target:-1});
+          this.code[jz].target = this.here();
+          this.compileStatements(s.else);
+          this.code[jmp].target = this.here();
+        } else {
+          this.code[jz].target = this.here();
+        }
+        break;
+      }
+      case "Loop": {
+        // evaluate bounds into temporaries via runtime loop slot
+        this.compileExpr(s.from);
+        this.compileExpr(s.to);
+        var slot = "$$loop_" + s.line + "_" + this.here();
+        var init = this.emit({op:"LOOPINIT", varName:s.var, slot:slot, line:s.line, target:-1});
+        var bodyStart = this.here();            // body start (after LOOPINIT)
+        this.compileStatements(s.body);
+        var next = this.emit({op:"LOOPNEXT", slot:slot, varName:s.var, line:s.line, target:bodyStart});
+        var afterBody = this.here();
+        this.code[next].target = bodyStart;     // continue -> back to body
+        this.code[next].exit = afterBody + 1;   // finish  -> skip past loop
+        this.code[init].target = bodyStart;     // start > end -> (checked at runtime)
+        this.code[init].skipTarget = afterBody + 1;
+        this.emit({op:"NOP", line:s.line});
+        break;
+      }
+      case "While": {
+        // Loop-back point must re-evaluate the condition each iteration,
+        // so mark the check label BEFORE compiling the condition expression.
+        var wcheck = this.here();
+        this.compileExpr(s.cond);               // re-run every iteration
+        var wjz = this.emit({op:"WHILECHECK", line:s.line, target:-1});
+        this.compileStatements(s.body);
+        this.emit({op:"JMP", line:s.line, target:wcheck});
+        this.code[wjz].target = this.here();    // exit when cond is false
+        break;
+      }
+      case "FuncDef":
+        // functions recorded; main body skips them (they live in separate fn bodies)
+        this.funcs[s.name] = {params:s.params, body:s.body};
+        break;
+      case "Return":
+        if (s.expr) this.compileExpr(s.expr); else this.emit({op:"PUSH", value:0, line:s.line});
+        this.emit({op:"RET", line:s.line});
+        break;
+      case "ExprStmt":
+        this.compileExpr(s.expr);
+        this.emit({op:"POP", line:s.line});
+        break;
+      default:
+        fail(s.line || 0, "internal: unknown statement kind " + s.kind);
+    }
+  };
+
+  Compiler.prototype.compileExpr = function(e){
+    switch (e.kind) {
+      case "Num": this.emit({op:"PUSH", value:e.value}); break;
+      case "Var": this.emit({op:"GETVAR", name:e.name, line:e.line||0}); break;
+      case "Unary": this.compileExpr(e.expr); this.emit({op:"UNARY", opr:e.op}); break;
+      case "Binary": this.compileExpr(e.l); this.compileExpr(e.r); this.emit({op:"BINARY", opr:e.op}); break;
+      case "Get": this.compileExpr(e.addr); this.emit({op:"GET"}); break;
+      case "Plot": this.compileExpr(e.x); this.compileExpr(e.y); this.emit({op:"PLOT"}); break;
+      case "GRead": this.compileExpr(e.index); this.emit({op:"GREAD", group:e.group}); break;
+      case "Call": {
+        for (var i=0;i<e.args.length;i++) this.compileExpr(e.args[i]);
+        this.emit({op:"CALL", name:e.name, argc:e.args.length});
+        break;
+      }
+      default: fail(0, "internal: unknown expr kind " + e.kind);
+    }
+  };
+  
+  /* ============================ VM =============================== */
+  function VM() { this.reset(); }
+
+  VM.prototype.reset = function(){
+    this.ram = new Array(RAM_SIZE); for (var i=0;i<RAM_SIZE;i++) this.ram[i]=0;
+    this.storage = new Array(STORAGE_SIZE); for (i=0;i<STORAGE_SIZE;i++) this.storage[i]=0;
+    this.screen = new Array(SCREEN_SIZE); for (i=0;i<SCREEN_SIZE;i++) this.screen[i]=0;
+    this.vars = {};             // globals (name -> value)
+    this.groups = {};           // name -> [addr,...]
+    this.funcBodies = {};       // name -> {params, body}
+    this.compiledFuncs = {};    // name -> {params, code, loopDepth?}
+    this.code = null;
+    this.pc = 0;
+    this.done = false;
+    this.error = null;
+    this.stack = [];
+    this.frames = [];
+    this.loopSlots = {};        // slotName -> {i, end, count}
+    this.compiled = false;
+  };
+
+  /* Push a call frame: locals + return address + saved loop slots */
+  VM.prototype.pushFrame = function(retAddr, locals){
+    this.frames.push({ retAddr: retAddr, locals: locals || {}, loopSlots: this.loopSlots });
+    this.loopSlots = {};
+  };
+  VM.prototype.popFrame = function(){
+    var f = this.frames.pop();
+    this.loopSlots = f ? f.loopSlots : {};
+    return f;
+  };
+
+  VM.prototype.lookupVar = function(name){
+    var fr = this.frames.length ? this.frames[this.frames.length-1] : null;
+    if (fr && Object.prototype.hasOwnProperty.call(fr.locals, name)) return fr.locals[name];
+    if (Object.prototype.hasOwnProperty.call(this.vars, name)) return this.vars[name];
+    return undefined;
+  };
+  VM.prototype.setVar = function(name, val, line){
+    var fr = this.frames.length ? this.frames[this.frames.length-1] : null;
+    if (fr && Object.prototype.hasOwnProperty.call(fr.locals, name)) { fr.locals[name] = val; return; }
+    if (Object.prototype.hasOwnProperty.call(this.vars, name)) { this.vars[name] = val; return; }
+    fail(line||0, "undefined variable '" + name + "'");
+  };
+
+  VM.prototype.checkRam = function(addr, line){
+    var a = Math.trunc(Number(addr));
+    if (isNaN(a) || a < 0 || a >= RAM_SIZE) fail(line||0, "RAM address out of range: " + addr);
+    return a;
+  };
+  VM.prototype.checkStore = function(addr, line){
+    var a = Math.trunc(Number(addr));
+    if (isNaN(a) || a < 0 || a >= STORAGE_SIZE) fail(line||0, "STORAGE address out of range: " + addr);
+    return a;
+  };
+  VM.prototype.screenIndex = function(x, y, line){
+    var xi = Math.trunc(Number(x)), yi = Math.trunc(Number(y));
+    if (isNaN(xi)||isNaN(yi)||xi<0||xi>=SCREEN_W||yi<0||yi>=SCREEN_H)
+      fail(line||0, "screen coordinate out of range: " + x + "," + y);
+    return yi*SCREEN_W + xi;
+  };
+
+  function toBit(v){ return (v ? 1 : 0); }
+  function nonzero(v){ return (v ? 1 : 0); }
+
+  VM.prototype.binop = function(op, a, b, line){
+    switch (op) {
+      case "+": return Math.trunc(Number(a)) + Math.trunc(Number(b));
+      case "-": return Math.trunc(Number(a)) - Math.trunc(Number(b));
+      case "*": return Math.trunc(Number(a)) * Math.trunc(Number(b));
+      case "/": { var d = Math.trunc(Number(b)); if (d===0) fail(line, "division by zero"); return Math.trunc(Math.trunc(Number(a))/d); }
+      case "%": { var m = Math.trunc(Number(b)); if (m===0) fail(line, "division by zero"); return Math.trunc(Number(a)) % m; }
+      case "==": return (Number(a) === Number(b)) ? 1 : 0;
+      case "!=": return (Number(a) !== Number(b)) ? 1 : 0;
+      case "<": return (Number(a) < Number(b)) ? 1 : 0;
+      case ">": return (Number(a) > Number(b)) ? 1 : 0;
+      case "<=": return (Number(a) <= Number(b)) ? 1 : 0;
+      case ">=": return (Number(a) >= Number(b)) ? 1 : 0;
+      case "and": return (nonzero(a) && nonzero(b)) ? 1 : 0;
+      case "or": return (nonzero(a) || nonzero(b)) ? 1 : 0;
+      case "xor": return (nonzero(a) !== nonzero(b)) ? 1 : 0;
+      case "band": return (toBit(a) & toBit(b));
+      case "bor": return (toBit(a) | toBit(b));
+      case "bxor": return (toBit(a) ^ toBit(b));
+      default: fail(line, "unknown operator '" + op + "'");
+    }
+  };
+  VM.prototype.unop = function(op, a, line){
+    switch (op) {
+      case "-": return -Math.trunc(Number(a));
+      case "not": return nonzero(a) ? 0 : 1;
+      case "bnot": return toBit(a) ? 0 : 1;
+      default: fail(line, "unknown unary operator '" + op + "'");
+    }
+  };
+  
+  /* ---- Function compilation (lazy, cached) ---- */
+  VM.prototype.compileFunc = function(name){
+    if (this.compiledFuncs[name]) return this.compiledFuncs[name];
+    var fb = this.funcBodies[name];
+    if (!fb) return null;
+    var c = new Compiler();
+    // share func table so nested func defs register
+    c.funcs = this.funcBodies;
+    c.compileStatements(fb.body);
+    c.emit({op:"PUSH", value:0});
+    c.emit({op:"RET"});
+    var info = {params:fb.params, code:c.code, entry:0};
+    this.compiledFuncs[name] = info;
+    // nested func defs discovered during compile get merged
+    this.funcBodies = c.funcs;
+    return info;
+  };
+
+  /* ---- One step: execute single instruction ---- */
+  VM.prototype.executeOne = function(){
+    if (this.done) return { ok:true, done:true, pc:this.pc };
+    if (!this.code) { this.done = true; return { ok:true, done:true, pc:this.pc }; }
+    var instr = this.code[this.pc];
+    if (!instr) { this.done = true; return { ok:true, done:true, pc:this.pc }; }
+    var cur = this.pc;
+    this.pc = cur + 1;   // default advance
+    try {
+      this.exec(instr);
+    } catch (e) {
+      this.error = errString(e);
+      this.done = true;
+      return { ok:false, done:false, error:this.error, pc:cur };
+    }
+    if (this.done) return { ok:true, done:true, pc:this.pc };
+    return { ok:true, done:false, pc:this.pc };
+  };
+
+  VM.prototype.pop = function(){ if (!this.stack.length) fail(0, "internal: stack underflow"); return this.stack.pop(); };
+  VM.prototype.push = function(v){ this.stack.push(v); };
+
+  VM.prototype.exec = function(instr){
+    var op = instr.op, line = instr.line || 0, a, b, x, y;
+    switch (op) {
+      case "HALT": this.done = true; break;
+
+      case "NOP": break;
+
+      case "PUSH": this.push(instr.value); break;
+      case "POP": this.pop(); break;
+
+      case "GETVAR": {
+        var v = this.lookupVar(instr.name);
+        if (v === undefined) fail(line, "undefined variable '" + instr.name + "'");
+        this.push(v);
+        break;
+      }
+      case "LET": {
+        var lv = this.pop();
+        var fr = this.frames.length ? this.frames[this.frames.length-1] : null;
+        if (fr) fr.locals[instr.name] = lv; else this.vars[instr.name] = lv;
+        break;
+      }
+      case "ASSIGN": this.setVar(instr.name, this.pop(), line); break;
+
+      case "UNARY": this.push(this.unop(instr.opr, this.pop(), line)); break;
+      case "BINARY": b = this.pop(); a = this.pop(); this.push(this.binop(instr.opr, a, b, line)); break;
+
+      case "GET": a = this.checkRam(this.pop(), line); this.push(toBit(this.ram[a])); break;
+      case "SET": b = this.pop(); a = this.checkRam(this.pop(), line); this.ram[a] = toBit(b); break;
+      case "SAVE": a = this.checkStore(this.pop(), line); this.storage[a] = toBit(this.ram[a]); break;
+      case "LOAD": a = this.checkStore(this.pop(), line); this.ram[a] = toBit(this.storage[a]); break;
+
+      case "PLOT": y = this.pop(); x = this.pop(); this.push(toBit(this.screen[this.screenIndex(x,y,line)])); break;
+      case "LED": b = this.pop(); y = this.pop(); x = this.pop(); this.screen[this.screenIndex(x,y,line)] = toBit(b); break;
+
+      case "GREAD": {
+        var gi = this.pop();
+        var grp = this.groups[instr.group];
+        if (!grp) fail(line, "group '" + instr.group + "' is not defined");
+        var idx = Math.trunc(Number(gi));
+        if (isNaN(idx) || idx < 0 || idx >= grp.length) fail(line, "group index out of range: " + gi);
+        var ra = this.checkRam(grp[idx], line);
+        this.push(toBit(this.ram[ra]));
+        break;
+      }
+      case "GWRITE": {
+        var gv = this.pop(); var gi2 = this.pop();
+        var grp2 = this.groups[instr.group];
+        if (!grp2) fail(line, "group '" + instr.group + "' is not defined");
+        var idx2 = Math.trunc(Number(gi2));
+        if (isNaN(idx2) || idx2 < 0 || idx2 >= grp2.length) fail(line, "group index out of range: " + gi2);
+        var ra2 = this.checkRam(grp2[idx2], line);
+        this.ram[ra2] = toBit(gv);
+        break;
+      }
+      case "GROUPDEF": {
+        var addrList = [];
+        for (var i=0;i<instr.addrs.length;i++) addrList.push(this.checkRam(instr.addrs[i], line));
+        this.groups[instr.name] = addrList;   // frozen: array replaced only via groupcopy
+        break;
+      }
+      case "GROUPCOPY": {
+        var src = this.groups[instr.src];
+        if (!src) fail(line, "group '" + instr.src + "' is not defined");
+        this.groups[instr.dst] = src.slice();
+        break;
+      }
+
+      case "JMP": this.pc = instr.target; break;
+      case "JZ": if (nonzero(this.pop()) === 0) this.pc = instr.target; break;
+
+      case "CALL": {
+        if (this.frames.length >= MAX_CALL_DEPTH) fail(line, "call stack depth exceeded (" + MAX_CALL_DEPTH + ")");
+        var info = this.compileFunc(instr.name);
+        if (!info) fail(line, "undefined function '" + instr.name + "'");
+        if (info.params.length !== instr.argc) fail(line, "function '" + instr.name + "' expects " + info.params.length + " args, got " + instr.argc);
+        var args = [];
+        for (var k=0;k<instr.argc;k++) args.unshift(this.pop());
+        var locals = {};
+        for (var p=0;p<info.params.length;p++) locals[info.params[p]] = args[p];
+        // save caller code/pc
+        this.frames.push({
+          retAddr: this.pc,
+          retCode: this.code,
+          retPc: this.pc,
+          locals: locals,
+          loopSlots: this.loopSlots
+        });
+        this.loopSlots = {};
+        this.code = info.code;
+        this.pc = 0;
+        break;
+      }
+      case "RET": {
+        var rv = this.pop();
+        var f = this.frames.pop();
+        if (!f) { this.done = true; break; }
+        this.loopSlots = f.loopSlots;
+        this.code = f.retCode;
+        this.pc = f.retAddr;
+        this.push(rv);
+        break;
+      }
+
+      case "LOOPINIT": {
+        var to_ = this.pop();
+        var from_ = this.pop();
+        var endV = Math.trunc(Number(to_));
+        var startV = Math.trunc(Number(from_));
+        this.loopSlots[instr.slot] = { i: startV, end: endV, count: 0 };
+        // set loop var in nearest scope (function-local if in a frame, else global)
+        this.setOrCreateLoopVar(instr.varName, startV, line);
+        // start > end => empty loop: skip body AND jump past the LOOPNEXT.
+        // We store the exit address on the LOOPNEXT via its target; reuse skipTarget.
+        if (startV > endV) { this.pc = (instr.skipTarget != null ? instr.skipTarget : instr.target); }
+        break;
+      }
+      case "LOOPNEXT": {
+        var slot = this.loopSlots[instr.slot];
+        if (!slot) fail(line, "internal: loop slot missing");
+        slot.count++;
+        if (slot.count > MAX_LOOP_ITERS) fail(line, "loop exceeded max iterations (" + MAX_LOOP_ITERS + ")");
+        slot.i++;
+        this.setOrCreateLoopVar(instr.varName, slot.i, line);
+        if (slot.i > slot.end) {
+          this.pc = (instr.exit != null ? instr.exit : instr.target);
+          delete this.loopSlots[instr.slot];
+        } else {
+          this.pc = instr.target;
+        }
+        break;
+      }
+      case "WHILECHECK": {
+        var cond = this.pop();
+        if (nonzero(cond) === 0) { this.pc = instr.target; break; }
+        instr.counter = (instr.counter || 0) + 1;
+        if (instr.counter > MAX_WHILE_ITERS) fail(line, "while loop exceeded max iterations (" + MAX_WHILE_ITERS + ")");
+        break;
+      }
+
+      default: fail(line, "internal: unknown opcode '" + op + "'");
+    }
+  };
+
+  VM.prototype.setOrCreateLoopVar = function(name, val, line){
+    // loop var lives in nearest scope so body reads/writes see it
+    var fr = this.frames.length ? this.frames[this.frames.length-1] : null;
+    if (fr) fr.locals[name] = val; else this.vars[name] = val;
+  };
+  
+  /* ========================= PUBLIC API ========================== */
+  var engine = new VM();
+  var currentCode = "";
+  var currentProgram = null;
+  var compiledProgram = null;
+
+  function compile(code){
+    var toks = tokenize(code);
+    var ast = new Parser(toks).parseProgram();
+    var comp = new Compiler();
+    var result = comp.compileProgram(ast);
+    // merge function bodies discovered at top level
+    return { tape: result, funcBodies: comp.funcs };
+  }
+
+  function loadInto(code){
+    // reset machine, compile; store tape. Returns {ok, error}
+    engine.reset();
+    currentCode = code;
+    try {
+      var c = compile(code);
+      engine.code = c.tape.code;
+      engine.funcBodies = c.funcBodies;
+      engine.pc = c.tape.entry;
+      engine.compiled = true;
+      engine.done = false;
+      engine.error = null;
+      return { ok:true };
+    } catch (e) {
+      engine.code = null;
+      engine.done = true;
+      engine.error = errString(e);
+      return { ok:false, error: engine.error };
+    }
+  }
+
+  var SysLang = {
+    version: "1.0",
+
+    /* run(code): load + loop step until done or error */
+    run: function(code){
+      if (typeof code === "string") {
+        var lr = loadInto(code);
+        if (!lr.ok) return { ok:false, error:lr.error };
+      } else if (!engine.compiled) {
+        return { ok:false, error:"no program loaded" };
+      }
+      var guard = 0, MAX_STEPS = 2000000;
+      while (!engine.done) {
+        var r = engine.executeOne();
+        if (!r.ok) return { ok:false, error:r.error };
+        if (++guard > MAX_STEPS) {
+          engine.error = "execution exceeded max steps (" + MAX_STEPS + ")";
+          engine.done = true;
+          return { ok:false, error:engine.error };
+        }
+      }
+      return { ok:true };
+    },
+
+    /* step(): execute exactly ONE instruction */
+    step: function(){
+      if (!engine.compiled) {
+        // compile current buffer if present
+        if (currentCode) {
+          var lr = loadInto(currentCode);
+          if (!lr.ok) return { ok:false, done:true, error:lr.error, pc:engine.pc };
+        } else {
+          return { ok:true, done:true, pc:engine.pc };
+        }
+      }
+      return engine.executeOne();
+    },
+
+    /* reset(): clear machine + compiled program */
+    reset: function(){
+      engine.reset();
+      compiledProgram = null;
+      return { ok:true };
+    },
+
+    /* getState(): snapshot of all machine state */
+    getState: function(){
+      var varsCopy = {}, k;
+      for (k in engine.vars) if (Object.prototype.hasOwnProperty.call(engine.vars,k)) varsCopy[k] = engine.vars[k];
+      var groupsCopy = {};
+      for (k in engine.groups) if (Object.prototype.hasOwnProperty.call(engine.groups,k)) groupsCopy[k] = engine.groups[k].slice();
+      return {
+        ram: engine.ram.slice(),
+        storage: engine.storage.slice(),
+        screen: engine.screen.slice(),
+        pc: engine.pc,
+        done: engine.done,
+        vars: varsCopy,
+        groups: groupsCopy,
+        error: engine.error
+      };
+    },
+
+    /* loadProgram(name, code): compile into buffer, no auto-run */
+    loadProgram: function(name, code){
+      currentProgram = name || null;
+      if (typeof code !== "string") code = "";
+      var lr = loadInto(code);
+      if (!lr.ok) return { ok:false, error:lr.error };
+      return { ok:true };
+    },
+
+    /* extras useful to UI (non-breaking additions) */
+    getProgramName: function(){ return currentProgram; },
+    getSource: function(){ return currentCode; },
+    setSource: function(code){ currentCode = code; },
+
+    /* internal exposure for debugging/tests */
+    _engine: engine,
+    _compile: compile,
+    _loadInto: loadInto
+  };
+
+  global.SysLang = SysLang;
+
+})(typeof window !== "undefined" ? window : this);
+
+</script>
+<script>
+/* ==== INLINE: syslang_ui.js ==== */
+/* =====================================================================
+ * SysLang UI Controller — v1.0
+ * Wires the DOM (per syslang_contract.md §3) to the engine (window.SysLang
+ * §4) and to the LED renderer (window.ScreenRenderer).
+ *
+ * Contract rules honoured:
+ *   - The core NEVER touches the DOM; this file is the ONLY DOM owner.
+ *   - UI reads engine state via SysLang.getState() (snapshots) — never
+ *     mutates engine arrays directly.
+ *   - Exposes window.SysLangUI for app-shell wiring.
+ *
+ * Plain ES5. No build step. Delegates LED drawing to ScreenRenderer.
+ * ===================================================================== */
+(function (global) {
+  "use strict";
+
+  var LS_PREFIX = "syslang_prog::";
+  var EXAMPLES = {
+    "Blink a bit across RAM (7.1)":
+      "let i = 0\nloop i = 0..7 {\n  set i, 1\n  save i\n}\n",
+    "Draw a diagonal LED (7.2)":
+      "let i = 0\nloop i = 0..15 {\n  led i, i, 1\n}\n",
+    "Group over RAM (7.3)":
+      "group a 10 11 12 13\ng a[0] = 1\ng a[1] = 1\nlet v = g a[2]\n",
+    "Recursion: factorial (7.4)":
+      "func fact(n) {\n  if n <= 1 { return 1 }\n  return n * fact(n - 1)\n}\nlet r = fact(5)\nset 0, r\n",
+    "Bits & booleans (7.5)":
+      "let p = 1\nlet q = 0\nlet x = band(p, q)\nlet y = bor(p, q)\nlet z = bnot(q)\nif y and not q {\n  set 5, z\n}\n",
+    "Checkerboard fill":
+      "let x = 0\nlet y = 0\nloop y = 0..15 {\n  loop x = 0..15 {\n    let m = (x + y) % 2\n    led x, y, m\n  }\n}\n",
+    "While counter":
+      "let n = 0\nwhile n < 8 {\n  set n, 1\n  n = n + 1\n}\n"
+  };
+
+  var els = {};          // resolved DOM nodes
+  var bound = false;
+  var running = false;   // is a Run in progress
+  var stopFlag = false;  // cooperative stop for Run loop
+  var timer = null;
+
+  /* ------------------------------ helpers ------------------------------ */
+  function $(id) { return document.getElementById(id); }
+
+  function log(kind, msg) {
+    if (!els.output) return;
+    var line = document.createElement("div");
+    line.className = "log-line log-" + kind;
+    var t = new Date().toLocaleTimeString();
+    line.textContent = "[" + t + "] " + msg;
+    els.output.appendChild(line);
+    els.output.scrollTop = els.output.scrollHeight;
+  }
+
+  function setChip(text, kind) {
+    if (!els.stateChip) return;
+    els.stateChip.textContent = text;
+    els.stateChip.setAttribute("data-state", kind || text.toLowerCase());
+    els.stateChip.className = "state-chip chip-" + (kind || text.toLowerCase());
+  }
+
+  function addrOf(index) {
+    // memory inspector: if addrInput holds a valid 0..1023, show that cell's
+    // raw bit; otherwise show the aggregate popcount text only.
+    var v = parseInt(els.addrInput && els.addrInput.value, 10);
+    return (isNaN(v) || v < 0 || v > 1023) ? null : v;
+  }
+
+  /* ------------------------- rendering: grids -------------------------- */
+  function renderBits(container, arr, highlightAddr) {
+    if (!container) return;
+    var n = arr.length;
+    var html = [];
+    for (var i = 0; i < n; i++) {
+      var on = arr[i] ? 1 : 0;
+      var cls = "cell " + (on ? "cell-on" : "cell-off");
+      if (highlightAddr === i) cls += " cell-hl";
+      html.push('<span class="' + cls + '" data-i="' + i + '" title="[' + i + '] = ' + on + '">' + on + "</span>");
+    }
+    container.innerHTML = html.join("");
+  }
+
+  function renderMemory(state) {
+    var hl = addrOf(state.ram);
+    renderBits(els.ramGrid, state.ram, hl);
+    renderBits(els.storageGrid, state.storage, hl);
+  }
+
+  /* ---------------------- rendering: current line ---------------------- */
+  function renderLine(state) {
+    if (!els.lineHighlight) return;
+    // pc is an instruction index, not a source line; the core records a
+    // per-instruction `line`. We surface it defensively when available.
+    var ln = null;
+    if (state && state.vars && typeof state.vars.__line === "number") ln = state.vars.__line;
+    if (ln === null && els.editor) {
+      // fallback: derive from pc via the engine's compiled tape if exposed
+      var eng = global.SysLang && global.SysLang._engine;
+      if (eng && eng.tape && eng.tape[state.pc] && typeof eng.tape[state.pc].line === "number") {
+        ln = eng.tape[state.pc].line;
+      }
+    }
+    if (ln === null) { els.lineHighlight.removeAttribute("data-line"); els.lineHighlight.textContent = "—"; return; }
+    els.lineHighlight.setAttribute("data-line", String(ln));
+    els.lineHighlight.textContent = "line " + ln;
+  }
+
+  /* ------------------------------ refresh ------------------------------ */
+  function refresh() {
+    var state = global.SysLang.getState();
+    renderMemory(state);
+    renderLine(state);
+    if (global.ScreenRenderer && global.ScreenRenderer.draw) {
+      global.ScreenRenderer.draw(state);
+    }
+    if (state.error) setChip("ERROR", "error");
+    else if (state.done) setChip("DONE", "done");
+    return state;
+  }
+
+  /* ------------------------------ actions ------------------------------ */
+  function applyStateToEditorHighlight() { refresh(); }
+
+  function onRun() {
+    if (running) return;
+    stopRun();               // ensure clean
+    var code = els.editor.value;
+    running = true; stopFlag = false;
+    setChip("RUNNING", "running");
+    log("info", "Run started…");
+    // Chunked driver so Stop stays responsive (cooperative).
+    var chunk = 2000;
+    function tick() {
+      if (stopFlag) { running = false; stopRun(); setChip("IDLE", "idle"); log("warn", "Run stopped by user."); refresh(); return; }
+      var steps = 0, res;
+      do {
+        res = global.SysLang.step();
+        steps++;
+        if (!res.ok) {
+          running = false;
+          setChip("ERROR", "error");
+          log("error", res.error);
+          refresh();
+          return;
+        }
+        if (res.done) {
+          running = false;
+          setChip("DONE", "done");
+          log("ok", "Program finished.");
+          refresh();
+          return;
+        }
+      } while (steps < chunk);
+      refresh();
+      timer = global.setTimeout(tick, 0);
+    }
+    // Run fresh: reset then load then step-drive.
+    global.SysLang.reset();
+    var lr = global.SysLang.loadProgram(els.programName ? els.programName.value : "untitled", code);
+    if (!lr.ok) {
+      running = false; setChip("ERROR", "error"); log("error", lr.error); refresh(); return;
+    }
+    refresh();
+    tick();
+  }
+
+  function stopRun() {
+    stopFlag = true;
+    if (timer) { global.clearTimeout(timer); timer = null; }
+    running = false;
+  }
+
+  function onStep() {
+    if (running) { log("warn", "Cannot step while running. Press Stop first."); return; }
+    var code = els.editor.value;
+    // Ensure a program is compiled without wiping progress if same source.
+    if (!global.SysLang._engine.compiled || global.SysLang.getProgramName() !== (els.programName ? els.programName.value : null)) {
+      global.SysLang.reset();
+      var lr = global.SysLang.loadProgram(els.programName ? els.programName.value : "untitled", code);
+      if (!lr.ok) { setChip("ERROR", "error"); log("error", lr.error); refresh(); return; }
+      log("info", "Compiled for stepping.");
+    }
+    var res = global.SysLang.step();
+    if (!res.ok) { setChip("ERROR", "error"); log("error", res.error); refresh(); return; }
+    if (res.done) { setChip("DONE", "done"); log("ok", "Program finished (step)."); }
+    else { setChip("RUNNING", "running"); log("info", "step → pc " + res.pc); }
+    refresh();
+  }
+
+  function onReset() {
+    stopRun();
+    if (timer) { global.clearTimeout(timer); timer = null; }
+    global.SysLang.reset();
+    setChip("IDLE", "idle");
+    log("info", "Machine reset.");
+    refresh();
+  }
+
+  function onStop() {
+    if (running || timer) { stopRun(); setChip("IDLE", "idle"); log("warn", "Stopped."); }
+    else { log("info", "Nothing running."); }
+    refresh();
+  }
+
+  /* --------------------------- examples / IO --------------------------- */
+  function populateExamples() {
+    if (!els.examples) return;
+    els.examples.innerHTML = "";
+    var first = document.createElement("option");
+    first.value = ""; first.textContent = "— load example —";
+    els.examples.appendChild(first);
+    for (var name in EXAMPLES) {
+      if (!Object.prototype.hasOwnProperty.call(EXAMPLES, name)) continue;
+      var o = document.createElement("option");
+      o.value = name; o.textContent = name;
+      els.examples.appendChild(o);
+    }
+  }
+
+  function onExampleChange() {
+    var name = els.examples.value;
+    if (!name || !EXAMPLES[name]) return;
+    els.editor.value = EXAMPLES[name];
+    if (els.programName) els.programName.value = name.replace(/[^A-Za-z0-9]+/g, "_").toLowerCase();
+    var lr = global.SysLang.loadProgram(els.programName ? els.programName.value : name, els.editor.value);
+    if (!lr.ok) { log("error", lr.error); setChip("ERROR", "error"); }
+    else { log("info", "Loaded example: " + name); setChip("IDLE", "idle"); }
+    refresh();
+  }
+
+  function keyFor(name) { return LS_PREFIX + (name || "untitled"); }
+
+  function onSave() {
+    var name = (els.programName && els.programName.value.trim()) || "untitled";
+    try {
+      global.localStorage.setItem(keyFor(name), els.editor.value);
+      log("ok", "Saved program '" + name + "' to localStorage.");
+    } catch (e) { log("error", "Save failed: " + e.message); }
+  }
+
+  function onLoad() {
+    var name = (els.programName && els.programName.value.trim()) || "untitled";
+    try {
+      var src = global.localStorage.getItem(keyFor(name));
+      if (src === null) { log("warn", "No saved program named '" + name + "'."); return; }
+      els.editor.value = src;
+      var lr = global.SysLang.loadProgram(name, src);
+      if (!lr.ok) { log("error", lr.error); setChip("ERROR", "error"); }
+      else { log("ok", "Loaded program '" + name + "'."); setChip("IDLE", "idle"); }
+      refresh();
+    } catch (e) { log("error", "Load failed: " + e.message); }
+  }
+
+  function onAddrInput() {
+    if (els.addrInput) {
+      var v = parseInt(els.addrInput.value, 10);
+      if (isNaN(v)) v = 0;
+      if (v < 0) v = 0; if (v > 1023) v = 1023;
+      els.addrInput.value = String(v);
+    }
+    refresh();
+  }
+
+  /* ------------------------------ init -------------------------------- */
+  function init() {
+    els = {
+      editor: $("editor"), runBtn: $("runBtn"), stepBtn: $("stepBtn"),
+      resetBtn: $("resetBtn"), stopBtn: $("stopBtn"), output: $("output"),
+      ramGrid: $("ramGrid"), storageGrid: $("storageGrid"),
+      screenCanvas: $("screenCanvas"), addrInput: $("addrInput"),
+      lineHighlight: $("lineHighlight"), stateChip: $("stateChip"),
+      examples: $("examples"), saveBtn: $("saveBtn"), loadBtn: $("loadBtn"),
+      programName: $("programName")
+    };
+    // Missing-ID guard (contract compliance).
+    var required = ["editor","runBtn","stepBtn","resetBtn","stopBtn","output","ramGrid","storageGrid","screenCanvas","addrInput","lineHighlight","stateChip","examples","saveBtn","loadBtn","programName"];
+    var missing = required.filter(function (k) { return !els[k]; });
+    if (missing.length) { console.error("[SysLangUI] missing DOM IDs:", missing.join(", ")); }
+
+    if (global.ScreenRenderer && global.ScreenRenderer.init && els.screenCanvas) {
+      global.ScreenRenderer.init(els.screenCanvas);
+    }
+
+    populateExamples();
+
+    if (els.runBtn) els.runBtn.addEventListener("click", onRun);
+    if (els.stepBtn) els.stepBtn.addEventListener("click", onStep);
+    if (els.resetBtn) els.resetBtn.addEventListener("click", onReset);
+    if (els.stopBtn) els.stopBtn.addEventListener("click", onStop);
+    if (els.examples) els.examples.addEventListener("change", onExampleChange);
+    if (els.saveBtn) els.saveBtn.addEventListener("click", onSave);
+    if (els.loadBtn) els.loadBtn.addEventListener("click", onLoad);
+    if (els.addrInput) els.addrInput.addEventListener("input", onAddrInput);
+    if (els.editor) els.editor.addEventListener("input", applyStateToEditorHighlight);
+
+    // Load the diagonal example by default so the screen shows life.
+    if (els.editor && !els.editor.value.trim()) {
+      els.editor.value = EXAMPLES["Draw a diagonal LED (7.2)"];
+      if (els.programName) els.programName.value = "diagonal";
+      global.SysLang.loadProgram("diagonal", els.editor.value);
+    }
+
+    setChip("IDLE", "idle");
+    log("info", "SysLang UI ready. Engine v" + (global.SysLang.version || "?") + ".");
+    refresh();
+    bound = true;
+  }
+
+  global.SysLangUI = {
+    init: init,
+    refresh: refresh,
+    log: log,
+    examples: EXAMPLES,
+    _els: function () { return els; }
+  };
+
+})(typeof window !== "undefined" ? window : this);
+
+</script>
+<script>
+  document.addEventListener("DOMContentLoaded", function () {
+    var okCore = !!window.SysLang, okScr = !!window.ScreenRenderer, okUI = !!window.SysLangUI;
+    if (!okCore || !okScr || !okUI) { console.error("SysLang boot: missing module", {okCore:okCore, okScr:okScr, okUI:okUI}); }
+    try {
+      if (okCore && okUI && window.SysLangUI.init) {
+        window.SysLangUI.init();
+        SysLang.run("set 5, 1\nled 3, 3, 1\n");
+        if (window.SysLangUI.log) window.SysLangUI.log("Self-test OK: modules loaded.");
+      }
+    } catch (e) { console.error("SysLang boot error:", e); }
+  });
+</script>
+</body>
+</html>
